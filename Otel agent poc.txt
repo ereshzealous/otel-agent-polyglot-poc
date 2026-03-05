@@ -1,0 +1,2712 @@
+# 🛒 ShopFlow — OpenTelemetry E2E Polyglot Demo
+
+**Business Use Case:** E-Commerce Order Processing Platform — realistic flow across 4 microservices with full distributed tracing + metrics via OTel agents (zero/minimal code change philosophy).
+
+---
+
+## 🏗️ Architecture & Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          ShopFlow Business Flow                             │
+│                                                                             │
+│  Client ──REST──▶ Order Service (Spring Boot :8080)                        │
+│                        │ save to PostgreSQL/ordersdb                        │
+│                        │ publish ──▶ Kafka [order.created]                  │
+│                        │                    │                               │
+│                        │        ┌───────────┘                               │
+│                        │        ▼                                           │
+│                        │  Inventory Service (FastAPI :8081)                 │
+│                        │        │ check Redis cache → PostgreSQL/inventorydb│
+│                        │        │ update stock                              │
+│                        │        │ publish ──▶ Kafka [inventory.reserved]    │
+│                        │                         │                          │
+│                        │              ┌──────────┘                          │
+│                        │              ▼                                     │
+│                        │   Notification Service (Express :8082)             │
+│                        │              │ consume order.created               │
+│                        │              │ consume inventory.reserved          │
+│                        │              │ REST call ──▶ Order Service         │
+│                        │              │ (update order status)               │
+│                        │              │ publish ──▶ Kafka [notification.sent]│
+│                        │                              │                     │
+│                        │                    ┌─────────┘                    │
+│                        │                    ▼                               │
+│                        │        Analytics Service (Go :8083)                │
+│                        │              │ consume all events                  │
+│                        │              │ aggregate to PostgreSQL/analyticsdb │
+│                        │              │ CRON (every 60s) → sales report     │
+│                        │              │ REST: GET /reports                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+OTel Agent Strategy:
+  Spring Boot  ──▶ -javaagent:opentelemetry-javaagent.jar   (ZERO code change)
+  FastAPI      ──▶ opentelemetry-instrument CLI wrapper      (ZERO code change)
+  Express      ──▶ --require ./tracing.js                    (30-line bootstrap)
+  Go           ──▶ OTel Go SDK in telemetry/setup.go         (one file, SDK-level)
+
+All ──▶ OTel Collector ──▶ Jaeger (traces) + Prometheus (metrics) + Grafana
+```
+
+---
+
+## 📦 INFRA: `docker-compose.yml`
+
+```yaml
+version: '3.8'
+
+services:
+
+  # ════════════════════════════════════════
+  # DATABASES & MESSAGING
+  # ════════════════════════════════════════
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: shopflow-postgres
+    environment:
+      POSTGRES_USER: shopflow
+      POSTGRES_PASSWORD: shopflow123
+      POSTGRES_DB: postgres
+    volumes:
+      - ./infra/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh
+    ports:
+      - "5432:5432"
+    networks: [shopflow]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopflow"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: shopflow-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    networks: [shopflow]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: shopflow-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks: [shopflow]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: shopflow-kafka
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 1
+    ports:
+      - "29092:29092"
+    networks: [shopflow]
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: shopflow-kafka-ui
+    depends_on: [kafka]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: shopflow
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8090:8080"
+    networks: [shopflow]
+
+  # ════════════════════════════════════════
+  # OTEL OBSERVABILITY STACK
+  # ════════════════════════════════════════
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.96.0
+    container_name: shopflow-otel-collector
+    volumes:
+      - ./infra/otel/otel-collector.yaml:/etc/otel/config.yaml
+    command: ["--config=/etc/otel/config.yaml"]
+    ports:
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
+      - "8889:8889"    # Prometheus scrape endpoint (metrics from collector)
+      - "13133:13133"  # Health check
+    depends_on: [jaeger, prometheus]
+    networks: [shopflow]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: shopflow-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14317:4317"   # Jaeger OTLP gRPC (mapped externally to 14317)
+    networks: [shopflow]
+
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: shopflow-prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-remote-write-receiver'
+    ports:
+      - "9090:9090"
+    networks: [shopflow]
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: shopflow-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    depends_on: [prometheus, jaeger]
+    networks: [shopflow]
+
+  # ════════════════════════════════════════
+  # MICROSERVICES
+  # ════════════════════════════════════════
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: shopflow-order
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ordersdb
+      SPRING_DATASOURCE_USERNAME: shopflow
+      SPRING_DATASOURCE_PASSWORD: shopflow123
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      JAVA_TOOL_OPTIONS: >-
+        -javaagent:/otel/opentelemetry-javaagent.jar
+        -Dotel.service.name=order-service
+        -Dotel.service.version=1.0.0
+        -Dotel.resource.attributes=team=platform,env=local
+        -Dotel.exporter.otlp.endpoint=http://otel-collector:4317
+        -Dotel.exporter.otlp.protocol=grpc
+        -Dotel.traces.exporter=otlp
+        -Dotel.metrics.exporter=otlp
+        -Dotel.logs.exporter=otlp
+        -Dotel.instrumentation.kafka.producer.propagation.enabled=true
+        -Dotel.instrumentation.kafka.consumer.propagation.enabled=true
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+  inventory-service:
+    build:
+      context: ./inventory-service
+      dockerfile: Dockerfile
+    container_name: shopflow-inventory
+    ports:
+      - "8081:8081"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://shopflow:shopflow123@postgres:5432/inventorydb
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PORT: 8081
+      OTEL_SERVICE_NAME: inventory-service
+      OTEL_SERVICE_VERSION: "1.0.0"
+      OTEL_RESOURCE_ATTRIBUTES: "team=platform,env=local"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: shopflow-notification
+    ports:
+      - "8082:8082"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      ORDER_SERVICE_URL: http://order-service:8080
+      PORT: 8082
+      OTEL_SERVICE_NAME: notification-service
+      OTEL_SERVICE_VERSION: "1.0.0"
+      OTEL_RESOURCE_ATTRIBUTES: "team=platform,env=local"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+    depends_on:
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+  analytics-service:
+    build:
+      context: ./analytics-service
+      dockerfile: Dockerfile
+    container_name: shopflow-analytics
+    ports:
+      - "8083:8083"
+    environment:
+      DATABASE_URL: postgres://shopflow:shopflow123@postgres:5432/analyticsdb?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      PORT: 8083
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: analytics-service
+      OTEL_SERVICE_VERSION: 1.0.0
+      CRON_INTERVAL_SECONDS: "60"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+networks:
+  shopflow:
+    driver: bridge
+```
+
+---
+
+## 📄 `infra/postgres/init.sh`
+
+```bash
+#!/bin/bash
+set -e
+
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-EOSQL
+  CREATE DATABASE ordersdb;
+  CREATE DATABASE inventorydb;
+  CREATE DATABASE analyticsdb;
+
+  \connect ordersdb
+  CREATE TABLE orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id VARCHAR(100) NOT NULL,
+    product_id  VARCHAR(100) NOT NULL,
+    quantity    INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price  NUMERIC(10,2) NOT NULL,
+    total_amount NUMERIC(12,2) NOT NULL,
+    status      VARCHAR(50) DEFAULT 'PENDING',
+    created_at  TIMESTAMP DEFAULT NOW(),
+    updated_at  TIMESTAMP DEFAULT NOW()
+  );
+  CREATE INDEX idx_orders_customer ON orders(customer_id);
+  CREATE INDEX idx_orders_status   ON orders(status);
+
+  \connect inventorydb
+  CREATE TABLE products (
+    id          VARCHAR(100) PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    stock       INTEGER NOT NULL DEFAULT 0,
+    reserved    INTEGER NOT NULL DEFAULT 0,
+    unit_price  NUMERIC(10,2) NOT NULL,
+    updated_at  TIMESTAMP DEFAULT NOW()
+  );
+  INSERT INTO products VALUES
+    ('PROD-001', 'Laptop Pro 15',   50,  0, 1299.99, NOW()),
+    ('PROD-002', 'Wireless Mouse',  200, 0, 29.99,   NOW()),
+    ('PROD-003', 'USB-C Hub',       150, 0, 49.99,   NOW()),
+    ('PROD-004', 'Mechanical Keyboard', 75, 0, 149.99, NOW()),
+    ('PROD-005', '4K Monitor',      30, 0, 599.99,  NOW());
+
+  \connect analyticsdb
+  CREATE TABLE order_events (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id    VARCHAR(100) NOT NULL,
+    event_type  VARCHAR(100) NOT NULL,
+    customer_id VARCHAR(100),
+    product_id  VARCHAR(100),
+    quantity    INTEGER,
+    amount      NUMERIC(12,2),
+    payload     JSONB,
+    occurred_at TIMESTAMP DEFAULT NOW()
+  );
+  CREATE TABLE sales_reports (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_period TIMESTAMP NOT NULL,
+    total_orders  INTEGER DEFAULT 0,
+    total_revenue NUMERIC(14,2) DEFAULT 0,
+    top_product   VARCHAR(100),
+    generated_at  TIMESTAMP DEFAULT NOW()
+  );
+EOSQL
+```
+
+---
+
+## 📄 `infra/otel/otel-collector.yaml`
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  resource:
+    attributes:
+      - action: insert
+        key: deployment.environment
+        value: local
+      - action: insert
+        key: collector.version
+        value: "0.96.0"
+
+  # Add trace ID to metrics for exemplars
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+
+exporters:
+  # Traces → Jaeger
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Metrics → Prometheus scrape endpoint
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: shopflow
+    send_timestamps: true
+    metric_expiration: 3m
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Debug logging (reduce in prod)
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+service:
+  extensions: [health_check, pprof]
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters:  [otlp/jaeger, debug]
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters:  [prometheus, debug]
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug]
+```
+
+---
+
+## 📄 `infra/prometheus/prometheus.yml`
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8889']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # Spring Boot actuator (prometheus endpoint exposed directly too)
+  - job_name: 'order-service'
+    static_configs:
+      - targets: ['order-service:8080']
+    metrics_path: '/actuator/prometheus'
+
+  # FastAPI metrics (exposed via prometheus_client)
+  - job_name: 'inventory-service'
+    static_configs:
+      - targets: ['inventory-service:8081']
+    metrics_path: '/metrics'
+
+  # Express metrics
+  - job_name: 'notification-service'
+    static_configs:
+      - targets: ['notification-service:8082']
+    metrics_path: '/metrics'
+
+  # Go metrics
+  - job_name: 'analytics-service'
+    static_configs:
+      - targets: ['analytics-service:8083']
+    metrics_path: '/metrics'
+```
+
+---
+
+## 📄 `infra/grafana/provisioning/datasources/datasources.yaml`
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+
+  - name: Jaeger
+    type: jaeger
+    url: http://jaeger:16686
+    editable: true
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: ''
+      nodeGraph:
+        enabled: true
+```
+
+---
+
+# 🟢 SERVICE 1: Order Service (Spring Boot)
+
+**OTel: Java Agent — ZERO code changes**
+
+## `order-service/Dockerfile`
+
+```dockerfile
+FROM eclipse-temurin:21-jdk-alpine AS build
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN apk add --no-cache maven && mvn package -DskipTests -q
+
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+
+# Download OTel Java Agent
+RUN apk add --no-cache curl && \
+    mkdir -p /otel && \
+    curl -sL https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.1.0/opentelemetry-javaagent.jar \
+    -o /otel/opentelemetry-javaagent.jar
+
+COPY --from=build /app/target/order-service-1.0.0.jar app.jar
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+## `order-service/pom.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.2</version>
+  </parent>
+
+  <groupId>com.shopflow</groupId>
+  <artifactId>order-service</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <java.version>21</java.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+    <!-- Prometheus metrics (also exposed natively via OTel agent OTLP) -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+    </dependency>
+    <!-- NOTE: No OTel SDK dependency! Agent handles everything -->
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <finalName>order-service-1.0.0</finalName>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+```
+
+## `order-service/src/main/resources/application.yml`
+
+```yaml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ordersdb}
+    username: ${SPRING_DATASOURCE_USERNAME:shopflow}
+    password: ${SPRING_DATASOURCE_PASSWORD:shopflow123}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 20000
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+  sql:
+    init:
+      mode: never
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: order-service-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.shopflow.*"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus,info
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: order-service
+      environment: local
+
+kafka:
+  topics:
+    order-created: order.created
+    order-updated: order.updated
+
+logging:
+  level:
+    com.shopflow: DEBUG
+    org.springframework.kafka: INFO
+```
+
+## `order-service/src/main/java/com/shopflow/order/OrderServiceApplication.java`
+
+```java
+package com.shopflow.order;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class OrderServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(OrderServiceApplication.class, args);
+    }
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/model/Order.java`
+
+```java
+package com.shopflow.order.model;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import jakarta.persistence.*;
+import jakarta.validation.constraints.*;
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "orders")
+public class Order {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private String id;
+
+    @NotBlank
+    @Column(name = "customer_id", nullable = false)
+    private String customerId;
+
+    @NotBlank
+    @Column(name = "product_id", nullable = false)
+    private String productId;
+
+    @Min(1)
+    @Column(nullable = false)
+    private Integer quantity;
+
+    @Column(name = "unit_price", nullable = false, precision = 10, scale = 2)
+    private BigDecimal unitPrice;
+
+    @Column(name = "total_amount", nullable = false, precision = 12, scale = 2)
+    private BigDecimal totalAmount;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private OrderStatus status = OrderStatus.PENDING;
+
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    @Column(name = "created_at")
+    private LocalDateTime createdAt;
+
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = LocalDateTime.now();
+        updatedAt = LocalDateTime.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
+
+    // ── Getters & Setters ──────────────────────────────────────────
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+    public String getCustomerId() { return customerId; }
+    public void setCustomerId(String customerId) { this.customerId = customerId; }
+    public String getProductId() { return productId; }
+    public void setProductId(String productId) { this.productId = productId; }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+    public BigDecimal getUnitPrice() { return unitPrice; }
+    public void setUnitPrice(BigDecimal unitPrice) { this.unitPrice = unitPrice; }
+    public BigDecimal getTotalAmount() { return totalAmount; }
+    public void setTotalAmount(BigDecimal totalAmount) { this.totalAmount = totalAmount; }
+    public OrderStatus getStatus() { return status; }
+    public void setStatus(OrderStatus status) { this.status = status; }
+    public LocalDateTime getCreatedAt() { return createdAt; }
+    public LocalDateTime getUpdatedAt() { return updatedAt; }
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/model/OrderStatus.java`
+
+```java
+package com.shopflow.order.model;
+
+public enum OrderStatus {
+    PENDING, CONFIRMED, INVENTORY_RESERVED, NOTIFIED, SHIPPED, DELIVERED, CANCELLED
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/model/CreateOrderRequest.java`
+
+```java
+package com.shopflow.order.model;
+
+import jakarta.validation.constraints.*;
+import java.math.BigDecimal;
+
+public class CreateOrderRequest {
+    @NotBlank  private String customerId;
+    @NotBlank  private String productId;
+    @Min(1)    private Integer quantity;
+    @Positive  private BigDecimal unitPrice;
+
+    // Getters & Setters
+    public String getCustomerId() { return customerId; }
+    public void setCustomerId(String customerId) { this.customerId = customerId; }
+    public String getProductId() { return productId; }
+    public void setProductId(String productId) { this.productId = productId; }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+    public BigDecimal getUnitPrice() { return unitPrice; }
+    public void setUnitPrice(BigDecimal unitPrice) { this.unitPrice = unitPrice; }
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/repository/OrderRepository.java`
+
+```java
+package com.shopflow.order.repository;
+
+import com.shopflow.order.model.Order;
+import com.shopflow.order.model.OrderStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface OrderRepository extends JpaRepository<Order, String> {
+    List<Order> findByCustomerId(String customerId);
+    List<Order> findByStatus(OrderStatus status);
+
+    @Query("SELECT COUNT(o) FROM Order o WHERE o.status = :status")
+    long countByStatus(OrderStatus status);
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/kafka/OrderEventProducer.java`
+
+```java
+package com.shopflow.order.kafka;
+
+import com.shopflow.order.model.Order;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Component;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+@Component
+public class OrderEventProducer {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderEventProducer.class);
+
+    private final KafkaTemplate<String, Map<String, Object>> kafkaTemplate;
+
+    @Value("${kafka.topics.order-created}")
+    private String orderCreatedTopic;
+
+    @Value("${kafka.topics.order-updated}")
+    private String orderUpdatedTopic;
+
+    public OrderEventProducer(KafkaTemplate<String, Map<String, Object>> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    public void publishOrderCreated(Order order) {
+        Map<String, Object> event = buildOrderEvent("ORDER_CREATED", order);
+        sendEvent(orderCreatedTopic, order.getId(), event);
+        log.info("Published ORDER_CREATED event for orderId={}", order.getId());
+    }
+
+    public void publishOrderUpdated(Order order) {
+        Map<String, Object> event = buildOrderEvent("ORDER_UPDATED", order);
+        sendEvent(orderUpdatedTopic, order.getId(), event);
+        log.info("Published ORDER_UPDATED event for orderId={}", order.getId());
+    }
+
+    private Map<String, Object> buildOrderEvent(String eventType, Order order) {
+        Map<String, Object> event = new HashMap<>();
+        event.put("eventType", eventType);
+        event.put("orderId", order.getId());
+        event.put("customerId", order.getCustomerId());
+        event.put("productId", order.getProductId());
+        event.put("quantity", order.getQuantity());
+        event.put("unitPrice", order.getUnitPrice());
+        event.put("totalAmount", order.getTotalAmount());
+        event.put("status", order.getStatus().name());
+        event.put("timestamp", System.currentTimeMillis());
+        return event;
+    }
+
+    private void sendEvent(String topic, String key, Map<String, Object> payload) {
+        CompletableFuture<SendResult<String, Map<String, Object>>> future =
+            kafkaTemplate.send(topic, key, payload);
+
+        future.whenComplete((result, ex) -> {
+            if (ex != null) {
+                log.error("Failed to send event to topic={} key={}", topic, key, ex);
+            } else {
+                log.debug("Event sent topic={} partition={} offset={}",
+                    topic,
+                    result.getRecordMetadata().partition(),
+                    result.getRecordMetadata().offset());
+            }
+        });
+    }
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/service/OrderService.java`
+
+```java
+package com.shopflow.order.service;
+
+import com.shopflow.order.kafka.OrderEventProducer;
+import com.shopflow.order.model.*;
+import com.shopflow.order.repository.OrderRepository;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+@Service
+public class OrderService {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
+    private final OrderRepository orderRepository;
+    private final OrderEventProducer eventProducer;
+
+    // Custom business metrics (OTel agent will auto-bridge Micrometer → OTLP)
+    private final Counter ordersCreatedCounter;
+    private final Counter ordersCancelledCounter;
+    private final Timer orderCreationTimer;
+
+    public OrderService(OrderRepository orderRepository,
+                        OrderEventProducer eventProducer,
+                        MeterRegistry meterRegistry) {
+        this.orderRepository = orderRepository;
+        this.eventProducer    = eventProducer;
+
+        this.ordersCreatedCounter = Counter.builder("shopflow.orders.created.total")
+            .description("Total number of orders created")
+            .tag("service", "order-service")
+            .register(meterRegistry);
+
+        this.ordersCancelledCounter = Counter.builder("shopflow.orders.cancelled.total")
+            .description("Total number of orders cancelled")
+            .tag("service", "order-service")
+            .register(meterRegistry);
+
+        this.orderCreationTimer = Timer.builder("shopflow.order.creation.duration")
+            .description("Time taken to create an order")
+            .register(meterRegistry);
+    }
+
+    @Transactional
+    public Order createOrder(CreateOrderRequest req) {
+        return orderCreationTimer.record(() -> {
+            log.info("Creating order for customer={} product={} qty={}",
+                req.getCustomerId(), req.getProductId(), req.getQuantity());
+
+            Order order = new Order();
+            order.setCustomerId(req.getCustomerId());
+            order.setProductId(req.getProductId());
+            order.setQuantity(req.getQuantity());
+            order.setUnitPrice(req.getUnitPrice());
+            order.setTotalAmount(
+                req.getUnitPrice().multiply(BigDecimal.valueOf(req.getQuantity()))
+            );
+            order.setStatus(OrderStatus.PENDING);
+
+            Order saved = orderRepository.save(order);
+            ordersCreatedCounter.increment();
+
+            // Kafka publish — OTel agent auto-instruments KafkaTemplate
+            // trace context is injected into Kafka headers automatically
+            eventProducer.publishOrderCreated(saved);
+
+            log.info("Order created successfully id={} total={}", saved.getId(), saved.getTotalAmount());
+            return saved;
+        });
+    }
+
+    public Order getOrder(String id) {
+        return orderRepository.findById(id)
+            .orElseThrow(() -> new OrderNotFoundException("Order not found: " + id));
+    }
+
+    public List<Order> getAllOrders() {
+        return orderRepository.findAll();
+    }
+
+    @Transactional
+    public Order updateStatus(String id, OrderStatus newStatus) {
+        Order order = getOrder(id);
+        log.info("Updating order={} status={} → {}", id, order.getStatus(), newStatus);
+
+        if (newStatus == OrderStatus.CANCELLED) {
+            ordersCancelledCounter.increment();
+        }
+
+        order.setStatus(newStatus);
+        Order updated = orderRepository.save(order);
+        eventProducer.publishOrderUpdated(updated);
+        return updated;
+    }
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/controller/OrderController.java`
+
+```java
+package com.shopflow.order.controller;
+
+import com.shopflow.order.model.*;
+import com.shopflow.order.service.OrderService;
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderController.class);
+    private final OrderService orderService;
+
+    public OrderController(OrderService orderService) {
+        this.orderService = orderService;
+    }
+
+    @PostMapping
+    public ResponseEntity<Order> createOrder(@Valid @RequestBody CreateOrderRequest request) {
+        log.info("POST /api/orders — customer={}", request.getCustomerId());
+        Order order = orderService.createOrder(request);
+        return ResponseEntity.status(201).body(order);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Order> getOrder(@PathVariable String id) {
+        return ResponseEntity.ok(orderService.getOrder(id));
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Order>> getAllOrders() {
+        return ResponseEntity.ok(orderService.getAllOrders());
+    }
+
+    @PutMapping("/{id}/status")
+    public ResponseEntity<Order> updateStatus(
+            @PathVariable String id,
+            @RequestParam OrderStatus status) {
+        return ResponseEntity.ok(orderService.updateStatus(id, status));
+    }
+
+    @GetMapping("/health")
+    public ResponseEntity<String> health() {
+        return ResponseEntity.ok("OK");
+    }
+}
+```
+
+## `order-service/src/main/java/com/shopflow/order/service/OrderNotFoundException.java`
+
+```java
+package com.shopflow.order.service;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException(String message) { super(message); }
+}
+```
+
+---
+
+# 🐍 SERVICE 2: Inventory Service (FastAPI)
+
+**OTel: `opentelemetry-instrument` CLI — ZERO code changes for traces**
+
+## `inventory-service/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
+    # Install OTel auto-instrumentation agent
+    opentelemetry-bootstrap -a install
+
+COPY . .
+
+# opentelemetry-instrument wraps uvicorn — auto-instruments FastAPI, SQLAlchemy, Redis, Kafka
+CMD ["opentelemetry-instrument", \
+     "uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8081", \
+     "--workers", "1"]
+```
+
+## `inventory-service/requirements.txt`
+
+```text
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.25
+aiopg==1.4.0
+redis[asyncio]==5.0.1
+aiokafka==0.10.0
+pydantic==2.6.1
+pydantic-settings==2.1.0
+httpx==0.26.0
+
+# OTel packages
+opentelemetry-distro==0.44b0
+opentelemetry-exporter-otlp-proto-grpc==1.23.0
+opentelemetry-instrumentation-fastapi==0.44b0
+opentelemetry-instrumentation-sqlalchemy==0.44b0
+opentelemetry-instrumentation-redis==0.44b0
+opentelemetry-instrumentation-httpx==0.44b0
+opentelemetry-instrumentation-logging==0.44b0
+
+# Metrics
+prometheus-client==0.20.0
+```
+
+## `inventory-service/app/config.py`
+
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    database_url: str = "postgresql+asyncpg://shopflow:shopflow123@localhost:5432/inventorydb"
+    redis_url: str = "redis://localhost:6379/0"
+    kafka_bootstrap_servers: str = "localhost:9092"
+    port: int = 8081
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+## `inventory-service/app/database.py`
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase
+from app.config import settings
+
+engine = create_async_engine(
+    settings.database_url,
+    pool_size=10,
+    max_overflow=20,
+    echo=False,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False
+)
+
+class Base(DeclarativeBase):
+    pass
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+```
+
+## `inventory-service/app/models.py`
+
+```python
+from sqlalchemy import Column, String, Integer, Numeric, DateTime, func
+from app.database import Base
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id         = Column(String(100), primary_key=True)
+    name       = Column(String(255), nullable=False)
+    stock      = Column(Integer, nullable=False, default=0)
+    reserved   = Column(Integer, nullable=False, default=0)
+    unit_price = Column(Numeric(10, 2), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    @property
+    def available_stock(self):
+        return self.stock - self.reserved
+```
+
+## `inventory-service/app/redis_client.py`
+
+```python
+import redis.asyncio as redis
+from app.config import settings
+import logging
+
+log = logging.getLogger(__name__)
+
+_redis_client = None
+
+async def get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(
+            settings.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+    return _redis_client
+
+async def get_cached_stock(product_id: str) -> int | None:
+    r = await get_redis()
+    val = await r.get(f"inventory:stock:{product_id}")
+    return int(val) if val is not None else None
+
+async def set_cached_stock(product_id: str, stock: int, ttl: int = 300):
+    r = await get_redis()
+    await r.setex(f"inventory:stock:{product_id}", ttl, stock)
+
+async def invalidate_stock_cache(product_id: str):
+    r = await get_redis()
+    await r.delete(f"inventory:stock:{product_id}")
+```
+
+## `inventory-service/app/services/inventory_service.py`
+
+```python
+import logging
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from app.models import Product
+from app.redis_client import get_cached_stock, set_cached_stock, invalidate_stock_cache
+
+log = logging.getLogger(__name__)
+
+class InsufficientStockError(Exception):
+    pass
+
+class ProductNotFoundError(Exception):
+    pass
+
+async def get_product(db: AsyncSession, product_id: str) -> Product:
+    result = await db.execute(select(Product).where(Product.id == product_id))
+    product = result.scalar_one_or_none()
+    if not product:
+        raise ProductNotFoundError(f"Product {product_id} not found")
+    return product
+
+async def get_available_stock(db: AsyncSession, product_id: str) -> int:
+    """Check Redis cache first, fall back to DB."""
+    cached = await get_cached_stock(product_id)
+    if cached is not None:
+        log.info("Cache HIT for product_id=%s stock=%d", product_id, cached)
+        return cached
+
+    log.info("Cache MISS for product_id=%s — querying DB", product_id)
+    product = await get_product(db, product_id)
+    available = product.available_stock
+    await set_cached_stock(product_id, available)
+    return available
+
+async def reserve_inventory(db: AsyncSession, product_id: str, quantity: int, order_id: str) -> dict:
+    """
+    Reserve inventory for an order:
+    1. Check Redis cache for available stock
+    2. Lock DB row, verify stock, update reserved count
+    3. Invalidate cache
+    """
+    log.info("Reserving product_id=%s qty=%d for order_id=%s", product_id, quantity, order_id)
+
+    # Use SELECT FOR UPDATE to prevent race conditions
+    result = await db.execute(
+        select(Product).where(Product.id == product_id).with_for_update()
+    )
+    product = result.scalar_one_or_none()
+
+    if not product:
+        raise ProductNotFoundError(f"Product {product_id} not found")
+
+    if product.available_stock < quantity:
+        raise InsufficientStockError(
+            f"Insufficient stock for {product_id}: "
+            f"available={product.available_stock}, requested={quantity}"
+        )
+
+    product.reserved += quantity
+    await db.commit()
+    await db.refresh(product)
+
+    # Invalidate cache after mutation
+    await invalidate_stock_cache(product_id)
+
+    log.info("Reserved product_id=%s qty=%d new_reserved=%d", product_id, quantity, product.reserved)
+    return {
+        "productId": product.id,
+        "productName": product.name,
+        "reservedQuantity": quantity,
+        "remainingStock": product.available_stock,
+        "orderId": order_id,
+    }
+
+async def get_all_products(db: AsyncSession) -> list[Product]:
+    result = await db.execute(select(Product))
+    return result.scalars().all()
+```
+
+## `inventory-service/app/kafka/consumer.py`
+
+```python
+import asyncio
+import json
+import logging
+from aiokafka import AIOKafkaConsumer
+from app.config import settings
+from app.database import AsyncSessionLocal
+from app.services.inventory_service import reserve_inventory, InsufficientStockError, ProductNotFoundError
+from app.kafka.producer import publish_inventory_reserved, publish_inventory_failed
+
+log = logging.getLogger(__name__)
+
+async def start_kafka_consumer():
+    """
+    Consume order.created events and reserve inventory.
+    Note: OTel auto-instrumentation wraps aiokafka — trace context
+    is extracted from Kafka headers automatically.
+    """
+    consumer = AIOKafkaConsumer(
+        "order.created",
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        group_id="inventory-service-group",
+        auto_offset_reset="earliest",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        enable_auto_commit=False,
+    )
+
+    await consumer.start()
+    log.info("Kafka consumer started — listening on topic: order.created")
+
+    try:
+        async for message in consumer:
+            await process_order_created(message.value)
+            await consumer.commit()
+    except asyncio.CancelledError:
+        log.info("Kafka consumer shutting down")
+    finally:
+        await consumer.stop()
+
+async def process_order_created(event: dict):
+    order_id   = event.get("orderId")
+    product_id = event.get("productId")
+    quantity   = event.get("quantity")
+    customer_id = event.get("customerId")
+
+    log.info("Processing ORDER_CREATED: orderId=%s product=%s qty=%d", order_id, product_id, quantity)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            result = await reserve_inventory(db, product_id, quantity, order_id)
+            await publish_inventory_reserved({
+                "eventType": "INVENTORY_RESERVED",
+                "orderId": order_id,
+                "customerId": customer_id,
+                "productId": product_id,
+                "quantity": quantity,
+                **result,
+            })
+            log.info("Inventory reserved for orderId=%s", order_id)
+
+        except InsufficientStockError as e:
+            log.warning("Insufficient stock for orderId=%s: %s", order_id, e)
+            await publish_inventory_failed({
+                "eventType": "INVENTORY_FAILED",
+                "orderId": order_id,
+                "reason": str(e),
+            })
+        except ProductNotFoundError as e:
+            log.error("Product not found for orderId=%s: %s", order_id, e)
+            await publish_inventory_failed({
+                "eventType": "INVENTORY_FAILED",
+                "orderId": order_id,
+                "reason": str(e),
+            })
+```
+
+## `inventory-service/app/kafka/producer.py`
+
+```python
+import json
+import logging
+from aiokafka import AIOKafkaProducer
+from app.config import settings
+
+log = logging.getLogger(__name__)
+_producer = None
+
+async def get_producer() -> AIOKafkaProducer:
+    global _producer
+    if _producer is None:
+        _producer = AIOKafkaProducer(
+            bootstrap_servers=settings.kafka_bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        await _producer.start()
+    return _producer
+
+async def publish_inventory_reserved(event: dict):
+    producer = await get_producer()
+    await producer.send_and_wait("inventory.reserved", value=event, key=event["orderId"].encode())
+    log.info("Published INVENTORY_RESERVED for orderId=%s", event["orderId"])
+
+async def publish_inventory_failed(event: dict):
+    producer = await get_producer()
+    await producer.send_and_wait("inventory.failed", value=event, key=event["orderId"].encode())
+    log.info("Published INVENTORY_FAILED for orderId=%s", event["orderId"])
+```
+
+## `inventory-service/app/main.py`
+
+```python
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from prometheus_client import make_asgi_app, Counter, Histogram
+
+from app.config import settings
+from app.database import get_db
+from app.models import Product
+from app.services.inventory_service import (
+    get_all_products, get_product, get_available_stock,
+    ProductNotFoundError
+)
+from app.kafka.consumer import start_kafka_consumer
+from app.kafka.producer import get_producer
+
+log = logging.getLogger(__name__)
+
+# ─── Custom Business Metrics ──────────────────────────────────────────────────
+# These are scraped by Prometheus directly AND pushed via OTel agent
+STOCK_CHECK_COUNTER = Counter(
+    "inventory_stock_checks_total",
+    "Total stock check requests",
+    ["product_id", "cache_hit"]
+)
+RESERVATION_COUNTER = Counter(
+    "inventory_reservations_total",
+    "Total inventory reservations",
+    ["status"]
+)
+RESERVATION_LATENCY = Histogram(
+    "inventory_reservation_duration_seconds",
+    "Time to reserve inventory",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0]
+)
+
+# ─── Lifespan (startup/shutdown) ──────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Starting Inventory Service...")
+    await get_producer()  # warm up Kafka producer
+    consumer_task = asyncio.create_task(start_kafka_consumer())
+    yield
+    consumer_task.cancel()
+    try:
+        await consumer_task
+    except asyncio.CancelledError:
+        pass
+    log.info("Inventory Service shutdown complete")
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="ShopFlow Inventory Service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Mount Prometheus metrics endpoint
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
+@app.get("/api/products")
+async def list_products(db: AsyncSession = Depends(get_db)):
+    products = await get_all_products(db)
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "stock": p.stock,
+            "reserved": p.reserved,
+            "available": p.available_stock,
+            "unitPrice": float(p.unit_price),
+        }
+        for p in products
+    ]
+
+@app.get("/api/products/{product_id}/stock")
+async def check_stock(product_id: str, db: AsyncSession = Depends(get_db)):
+    try:
+        available = await get_available_stock(db, product_id)
+        STOCK_CHECK_COUNTER.labels(product_id=product_id, cache_hit="unknown").inc()
+        return {"productId": product_id, "availableStock": available}
+    except ProductNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/api/products/{product_id}")
+async def get_product_detail(product_id: str, db: AsyncSession = Depends(get_db)):
+    try:
+        p = await get_product(db, product_id)
+        return {
+            "id": p.id,
+            "name": p.name,
+            "stock": p.stock,
+            "reserved": p.reserved,
+            "available": p.available_stock,
+            "unitPrice": float(p.unit_price),
+        }
+    except ProductNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "inventory-service"}
+```
+
+---
+
+# 🟨 SERVICE 3: Notification Service (Express/Node.js)
+
+**OTel: `--require ./tracing.js` — minimal 30-line bootstrap**
+
+## `notification-service/Dockerfile`
+
+```dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+
+# Load OTel SDK before app starts — auto-instruments Express, http, Kafka
+CMD ["node", "--require", "./tracing.js", "src/index.js"]
+```
+
+## `notification-service/package.json`
+
+```json
+{
+  "name": "notification-service",
+  "version": "1.0.0",
+  "description": "ShopFlow Notification Service",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --require ./tracing.js src/index.js",
+    "dev": "nodemon --require ./tracing.js src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "kafkajs": "^2.2.4",
+    "axios": "^1.6.7",
+    "prom-client": "^15.1.0",
+    "@opentelemetry/sdk-node": "^0.48.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.42.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.48.0",
+    "@opentelemetry/exporter-metrics-otlp-proto": "^0.48.0",
+    "@opentelemetry/sdk-metrics": "^1.21.0",
+    "@opentelemetry/resources": "^1.21.0",
+    "@opentelemetry/semantic-conventions": "^1.21.0"
+  }
+}
+```
+
+## `notification-service/tracing.js`
+
+```javascript
+'use strict';
+
+const { NodeSDK }                        = require('@opentelemetry/sdk-node');
+const { getNodeAutoInstrumentations }    = require('@opentelemetry/auto-instrumentations-node');
+const { OTLPTraceExporter }              = require('@opentelemetry/exporter-trace-otlp-proto');
+const { OTLPMetricExporter }             = require('@opentelemetry/exporter-metrics-otlp-proto');
+const { PeriodicExportingMetricReader }  = require('@opentelemetry/sdk-metrics');
+const { Resource }                       = require('@opentelemetry/resources');
+const { SemanticResourceAttributes }     = require('@opentelemetry/semantic-conventions');
+
+const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318';
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    [SemanticResourceAttributes.SERVICE_NAME]:    process.env.OTEL_SERVICE_NAME || 'notification-service',
+    [SemanticResourceAttributes.SERVICE_VERSION]: process.env.OTEL_SERVICE_VERSION || '1.0.0',
+    'deployment.environment': 'local',
+    'team': 'platform',
+  }),
+
+  traceExporter: new OTLPTraceExporter({
+    url: `${otlpEndpoint}/v1/traces`,
+  }),
+
+  metricReader: new PeriodicExportingMetricReader({
+    exporter: new OTLPMetricExporter({
+      url: `${otlpEndpoint}/v1/metrics`,
+    }),
+    exportIntervalMillis: 15000,
+  }),
+
+  // Auto-instruments: express, http, kafkajs, dns, net, etc.
+  instrumentations: [
+    getNodeAutoInstrumentations({
+      '@opentelemetry/instrumentation-fs': { enabled: false }, // too noisy
+      '@opentelemetry/instrumentation-http': { enabled: true },
+      '@opentelemetry/instrumentation-express': { enabled: true },
+    }),
+  ],
+});
+
+sdk.start();
+console.log('OTel SDK initialized for notification-service');
+
+process.on('SIGTERM', () => sdk.shutdown().then(() => process.exit(0)));
+process.on('SIGINT',  () => sdk.shutdown().then(() => process.exit(0)));
+```
+
+## `notification-service/src/config.js`
+
+```javascript
+module.exports = {
+  port:              parseInt(process.env.PORT || '8082'),
+  kafkaBrokers:      (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
+  orderServiceUrl:   process.env.ORDER_SERVICE_URL || 'http://localhost:8080',
+  kafkaGroupId:      'notification-service-group',
+  topics: {
+    orderCreated:       'order.created',
+    inventoryReserved:  'inventory.reserved',
+    inventoryFailed:    'inventory.failed',
+    notificationSent:   'notification.sent',
+  },
+};
+```
+
+## `notification-service/src/metrics.js`
+
+```javascript
+const client = require('prom-client');
+
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+const notificationsSent = new client.Counter({
+  name: 'notifications_sent_total',
+  help: 'Total notifications dispatched',
+  labelNames: ['channel', 'event_type', 'status'],
+  registers: [register],
+});
+
+const notificationLatency = new client.Histogram({
+  name: 'notification_processing_duration_seconds',
+  help: 'Time to process and send notification',
+  labelNames: ['event_type'],
+  buckets: [0.005, 0.01, 0.05, 0.1, 0.5, 1],
+  registers: [register],
+});
+
+const orderStatusUpdates = new client.Counter({
+  name: 'order_status_updates_total',
+  help: 'Total order status update calls made to order-service',
+  labelNames: ['status', 'outcome'],
+  registers: [register],
+});
+
+module.exports = { register, notificationsSent, notificationLatency, orderStatusUpdates };
+```
+
+## `notification-service/src/notifier.js`
+
+```javascript
+const axios  = require('axios');
+const config = require('./config');
+const { notificationsSent, orderStatusUpdates } = require('./metrics');
+const logger = require('./logger');
+
+/**
+ * Simulate sending notifications (email/SMS/push).
+ * In production, integrate with SendGrid, Twilio, Firebase, etc.
+ */
+async function sendOrderConfirmation(event) {
+  const { orderId, customerId, productId, quantity } = event;
+  logger.info({ orderId, customerId }, 'Sending order confirmation notification');
+
+  // Simulate notification dispatch
+  await simulateDelay(50, 150);
+
+  notificationsSent.labels({
+    channel: 'email',
+    event_type: 'ORDER_CONFIRMED',
+    status: 'success',
+  }).inc();
+
+  logger.info({ orderId }, 'Order confirmation sent via email');
+  return { channel: 'email', recipient: customerId, template: 'order-confirmation' };
+}
+
+async function sendInventoryConfirmation(event) {
+  const { orderId, customerId, productId, quantity } = event;
+  logger.info({ orderId }, 'Sending inventory reserved notification');
+
+  await simulateDelay(30, 100);
+
+  notificationsSent.labels({
+    channel: 'push',
+    event_type: 'INVENTORY_RESERVED',
+    status: 'success',
+  }).inc();
+
+  return { channel: 'push', recipient: customerId, template: 'inventory-reserved' };
+}
+
+async function sendInventoryFailureAlert(event) {
+  const { orderId, reason } = event;
+  logger.warn({ orderId, reason }, 'Sending inventory failure notification');
+
+  notificationsSent.labels({
+    channel: 'email',
+    event_type: 'INVENTORY_FAILED',
+    status: 'failure_alert',
+  }).inc();
+
+  return { channel: 'email', template: 'inventory-failed' };
+}
+
+/**
+ * Update order status via REST call to order-service.
+ * OTel auto-instruments axios — this REST call will be part of the trace.
+ */
+async function updateOrderStatus(orderId, status) {
+  logger.info({ orderId, status }, 'Updating order status via REST');
+  try {
+    const response = await axios.put(
+      `${config.orderServiceUrl}/api/orders/${orderId}/status`,
+      null,
+      { params: { status }, timeout: 5000 }
+    );
+    orderStatusUpdates.labels({ status, outcome: 'success' }).inc();
+    return response.data;
+  } catch (err) {
+    orderStatusUpdates.labels({ status, outcome: 'error' }).inc();
+    logger.error({ orderId, status, err: err.message }, 'Failed to update order status');
+    throw err;
+  }
+}
+
+function simulateDelay(minMs, maxMs) {
+  const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+module.exports = { sendOrderConfirmation, sendInventoryConfirmation, sendInventoryFailureAlert, updateOrderStatus };
+```
+
+## `notification-service/src/kafka/consumer.js`
+
+```javascript
+const { Kafka } = require('kafkajs');
+const config    = require('../config');
+const logger    = require('../logger');
+const { notificationLatency } = require('../metrics');
+const {
+  sendOrderConfirmation,
+  sendInventoryConfirmation,
+  sendInventoryFailureAlert,
+  updateOrderStatus,
+} = require('../notifier');
+
+let producer;
+
+async function createProducer(kafka) {
+  producer = kafka.producer();
+  await producer.connect();
+  return producer;
+}
+
+async function publishNotificationSent(event) {
+  await producer.send({
+    topic: config.topics.notificationSent,
+    messages: [{
+      key: event.orderId,
+      value: JSON.stringify({
+        eventType: 'NOTIFICATION_SENT',
+        ...event,
+        timestamp: Date.now(),
+      }),
+    }],
+  });
+}
+
+async function startKafkaConsumer() {
+  const kafka = new Kafka({
+    clientId: 'notification-service',
+    brokers: config.kafkaBrokers,
+    retry: { retries: 8 },
+  });
+
+  const consumer = kafka.consumer({ groupId: config.kafkaGroupId });
+  await createProducer(kafka);
+  await consumer.connect();
+
+  await consumer.subscribe({
+    topics: [
+      config.topics.orderCreated,
+      config.topics.inventoryReserved,
+      config.topics.inventoryFailed,
+    ],
+    fromBeginning: false,
+  });
+
+  logger.info('Kafka consumer started — listening on order.created, inventory.reserved, inventory.failed');
+
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      const end = notificationLatency.labels({ event_type: topic }).startTimer();
+      try {
+        const event = JSON.parse(message.value.toString());
+        logger.info({ topic, orderId: event.orderId }, 'Received Kafka event');
+
+        switch (topic) {
+          case config.topics.orderCreated:
+            await sendOrderConfirmation(event);
+            // Update order status to CONFIRMED
+            await updateOrderStatus(event.orderId, 'CONFIRMED');
+            await publishNotificationSent({ orderId: event.orderId, type: 'order_confirmation' });
+            break;
+
+          case config.topics.inventoryReserved:
+            await sendInventoryConfirmation(event);
+            // Update order status to INVENTORY_RESERVED
+            await updateOrderStatus(event.orderId, 'INVENTORY_RESERVED');
+            await publishNotificationSent({ orderId: event.orderId, type: 'inventory_confirmation' });
+            break;
+
+          case config.topics.inventoryFailed:
+            await sendInventoryFailureAlert(event);
+            await updateOrderStatus(event.orderId, 'CANCELLED');
+            await publishNotificationSent({ orderId: event.orderId, type: 'inventory_failure_alert' });
+            break;
+        }
+      } catch (err) {
+        logger.error({ topic, err: err.message }, 'Error processing Kafka message');
+      } finally {
+        end();
+      }
+    },
+  });
+
+  return consumer;
+}
+
+module.exports = { startKafkaConsumer };
+```
+
+## `notification-service/src/logger.js`
+
+```javascript
+const pino = require('pino') || console;
+// Simple logger — replace with pino if desired
+const logger = {
+  info:  (obj, msg) => console.log(JSON.stringify({ level: 'INFO',  ...obj, msg })),
+  warn:  (obj, msg) => console.warn(JSON.stringify({ level: 'WARN',  ...obj, msg })),
+  error: (obj, msg) => console.error(JSON.stringify({ level: 'ERROR', ...obj, msg })),
+};
+module.exports = logger;
+```
+
+## `notification-service/src/index.js`
+
+```javascript
+'use strict';
+
+const express = require('express');
+const config  = require('./config');
+const { register } = require('./metrics');
+const { startKafkaConsumer } = require('./kafka/consumer');
+const logger  = require('./logger');
+
+const app = express();
+app.use(express.json());
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'notification-service' });
+});
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.get('/api/notifications/status', (req, res) => {
+  res.json({ status: 'running', consumers: ['order.created', 'inventory.reserved', 'inventory.failed'] });
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+async function bootstrap() {
+  await startKafkaConsumer();
+
+  app.listen(config.port, () => {
+    logger.info({}, `Notification service listening on port ${config.port}`);
+  });
+}
+
+bootstrap().catch(err => {
+  logger.error({ err: err.message }, 'Fatal startup error');
+  process.exit(1);
+});
+```
+
+---
+
+# 🔵 SERVICE 4: Analytics Service (Go)
+
+**OTel: Go SDK in single `telemetry/setup.go` file + Cron scheduler**
+
+## `analytics-service/Dockerfile`
+
+```dockerfile
+FROM golang:1.22-alpine AS build
+WORKDIR /app
+RUN apk add --no-cache git
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o analytics-service ./cmd/main.go
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /app
+COPY --from=build /app/analytics-service .
+ENTRYPOINT ["./analytics-service"]
+```
+
+## `analytics-service/go.mod`
+
+```go
+module github.com/shopflow/analytics-service
+
+go 1.22
+
+require (
+    github.com/IBM/sarama v1.43.0
+    github.com/jackc/pgx/v5 v5.5.3
+    github.com/robfig/cron/v3 v3.0.1
+    github.com/prometheus/client_golang v1.19.0
+
+    go.opentelemetry.io/otel v1.24.0
+    go.opentelemetry.io/otel/sdk v1.24.0
+    go.opentelemetry.io/otel/sdk/metric v1.24.0
+    go.opentelemetry.io/otel/trace v1.24.0
+    go.opentelemetry.io/otel/metric v1.24.0
+    go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.24.0
+    go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.24.0
+    go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.49.0
+    go.opentelemetry.io/otel/semconv/v1.24.0 v1.24.0
+    google.golang.org/grpc v1.62.0
+)
+```
+
+## `analytics-service/telemetry/setup.go`
+
+```go
+package telemetry
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/metric"
+    "go.opentelemetry.io/otel/propagation"
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+    "go.opentelemetry.io/otel/trace"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+// ShutdownFunc cleans up telemetry providers on exit
+type ShutdownFunc func(context.Context) error
+
+// Init sets up OTel trace + metric providers, returns combined shutdown function
+func Init(ctx context.Context, serviceName, serviceVersion, otlpEndpoint string) (ShutdownFunc, error) {
+    res, err := resource.New(ctx,
+        resource.WithAttributes(
+            semconv.ServiceName(serviceName),
+            semconv.ServiceVersion(serviceVersion),
+            semconv.DeploymentEnvironment("local"),
+        ),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to create OTel resource: %w", err)
+    }
+
+    // gRPC connection to OTel Collector
+    conn, err := grpc.DialContext(ctx, otlpEndpoint,
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+        grpc.WithBlock(),
+        grpc.WithTimeout(5*time.Second),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to OTel collector at %s: %w", otlpEndpoint, err)
+    }
+
+    // ── Trace Provider ──────────────────────────────────────────────────
+    traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
+    if err != nil {
+        return nil, fmt.Errorf("failed to create trace exporter: %w", err)
+    }
+
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(traceExporter),
+        sdktrace.WithResource(res),
+        sdktrace.WithSampler(sdktrace.AlwaysSample()),
+    )
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{},
+        propagation.Baggage{},
+    ))
+
+    // ── Metric Provider ─────────────────────────────────────────────────
+    metricExporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
+    if err != nil {
+        return nil, fmt.Errorf("failed to create metric exporter: %w", err)
+    }
+
+    mp := sdkmetric.NewMeterProvider(
+        sdkmetric.WithReader(
+            sdkmetric.NewPeriodicReader(metricExporter,
+                sdkmetric.WithInterval(15*time.Second),
+            ),
+        ),
+        sdkmetric.WithResource(res),
+    )
+    otel.SetMeterProvider(mp)
+
+    shutdown := func(ctx context.Context) error {
+        if err := tp.Shutdown(ctx); err != nil {
+            return err
+        }
+        return mp.Shutdown(ctx)
+    }
+
+    return shutdown, nil
+}
+
+// Tracer returns a named tracer
+func Tracer(name string) trace.Tracer {
+    return otel.Tracer(name)
+}
+
+// Meter returns a named meter
+func Meter(name string) metric.Meter {
+    return otel.Meter(name)
+}
+```
+
+## `analytics-service/internal/db/postgres.go`
+
+```go
+package db
+
+import (
+    "context"
+    "fmt"
+    "os"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+var Pool *pgxpool.Pool
+
+func Connect(ctx context.Context) error {
+    dsn := os.Getenv("DATABASE_URL")
+    if dsn == "" {
+        return fmt.Errorf("DATABASE_URL not set")
+    }
+
+    config, err := pgxpool.ParseConfig(dsn)
+    if err != nil {
+        return fmt.Errorf("invalid DATABASE_URL: %w", err)
+    }
+    config.MaxConns = 20
+
+    pool, err := pgxpool.NewWithConfig(ctx, config)
+    if err != nil {
+        return fmt.Errorf("failed to connect to postgres: %w", err)
+    }
+
+    if err := pool.Ping(ctx); err != nil {
+        return fmt.Errorf("postgres ping failed: %w", err)
+    }
+
+    Pool = pool
+    return nil
+}
+```
+
+## `analytics-service/internal/repository/analytics_repo.go`
+
+```go
+package repository
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/shopflow/analytics-service/internal/db"
+)
+
+type OrderEvent struct {
+    OrderID    string          `json:"orderId"`
+    EventType  string          `json:"eventType"`
+    CustomerID string          `json:"customerId"`
+    ProductID  string          `json:"productId"`
+    Quantity   int             `json:"quantity"`
+    Amount     float64         `json:"amount"`
+    Payload    json.RawMessage `json:"payload,omitempty"`
+}
+
+type SalesReport struct {
+    ReportPeriod time.Time
+    TotalOrders  int
+    TotalRevenue float64
+    TopProduct   string
+    GeneratedAt  time.Time
+}
+
+// SaveOrderEvent persists a Kafka event to the analytics DB
+func SaveOrderEvent(ctx context.Context, event OrderEvent) error {
+    payload, _ := json.Marshal(event)
+    _, err := db.Pool.Exec(ctx, `
+        INSERT INTO order_events (order_id, event_type, customer_id, product_id, quantity, amount, payload)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, event.OrderID, event.EventType, event.CustomerID, event.ProductID,
+       event.Quantity, event.Amount, payload)
+    return err
+}
+
+// GenerateSalesReport aggregates last-hour events into a report
+func GenerateSalesReport(ctx context.Context) (*SalesReport, error) {
+    report := &SalesReport{
+        ReportPeriod: time.Now().Truncate(time.Minute),
+        GeneratedAt:  time.Now(),
+    }
+
+    // Total orders created in last hour
+    err := db.Pool.QueryRow(ctx, `
+        SELECT COUNT(*), COALESCE(SUM(amount), 0)
+        FROM order_events
+        WHERE event_type = 'ORDER_CREATED'
+          AND occurred_at >= NOW() - INTERVAL '1 hour'
+    `).Scan(&report.TotalOrders, &report.TotalRevenue)
+    if err != nil {
+        return nil, fmt.Errorf("failed to aggregate orders: %w", err)
+    }
+
+    // Top product by quantity in last hour
+    db.Pool.QueryRow(ctx, `
+        SELECT product_id
+        FROM order_events
+        WHERE event_type = 'ORDER_CREATED'
+          AND occurred_at >= NOW() - INTERVAL '1 hour'
+          AND product_id IS NOT NULL
+        GROUP BY product_id
+        ORDER BY SUM(quantity) DESC
+        LIMIT 1
+    `).Scan(&report.TopProduct)
+
+    // Save report
+    _, err = db.Pool.Exec(ctx, `
+        INSERT INTO sales_reports (report_period, total_orders, total_revenue, top_product, generated_at)
+        VALUES ($1, $2, $3, $4, $5)
+    `, report.ReportPeriod, report.TotalOrders, report.TotalRevenue, report.TopProduct, report.GeneratedAt)
+
+    return report, err
+}
+
+func GetRecentReports(ctx context.Context, limit int) ([]SalesReport, error) {
+    rows, err := db.Pool.Query(ctx, `
+        SELECT report_period, total_orders, total_revenue, top_product, generated_at
+        FROM sales_reports
+        ORDER BY generated_at DESC
+        LIMIT $1
+    `, limit)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var reports []SalesReport
+    for rows.Next() {
+        var r SalesReport
+        rows.Scan(&r.ReportPeriod, &r.TotalOrders, &r.TotalRevenue, &r.TopProduct, &r.GeneratedAt)
+        reports = append(reports, r)
+    }
+    return reports, nil
+}
+```
+
+## `analytics-service/internal/kafka/consumer.go`
+
+```go
+package kafka
+
+import (
+    "context"
+    "encoding/json"
+    "log"
+    "os"
+    "strings"
+
+    "github.com/IBM/sarama"
+    "github.com/shopflow/analytics-service/internal/repository"
+    "github.com/shopflow/analytics-service/telemetry"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/codes"
+)
+
+type consumerGroupHandler struct{}
+
+func (h consumerGroupHandler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
+func (h consumerGroupHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
+func (h consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+    tracer := telemetry.Tracer("analytics-service/kafka-consumer")
+
+    for msg := range claim.Messages() {
+        // Extract trace context from Kafka headers (W3C TraceContext)
+        ctx := extractTraceContext(context.Background(), msg.Headers)
+
+        ctx, span := tracer.Start(ctx, "kafka.consume "+msg.Topic,
+            // OTel semantic conventions for messaging
+        )
+        span.SetAttributes(
+            attribute.String("messaging.system", "kafka"),
+            attribute.String("messaging.destination", msg.Topic),
+            attribute.String("messaging.operation", "receive"),
+            attribute.Int64("messaging.kafka.partition", int64(msg.Partition)),
+            attribute.Int64("messaging.kafka.offset", msg.Offset),
+        )
+
+        var event repository.OrderEvent
+        if err := json.Unmarshal(msg.Value, &event); err != nil {
+            log.Printf("Failed to unmarshal event: %v", err)
+            span.RecordError(err)
+            span.SetStatus(codes.Error, err.Error())
+            span.End()
+            session.MarkMessage(msg, "")
+            continue
+        }
+
+        if err := repository.SaveOrderEvent(ctx, event); err != nil {
+            log.Printf("Failed to save event to DB: %v", err)
+            span.RecordError(err)
+            span.SetStatus(codes.Error, err.Error())
+        } else {
+            log.Printf("Stored event: type=%s orderId=%s", event.EventType, event.OrderID)
+            span.SetStatus(codes.Ok, "event stored")
+        }
+
+        span.End()
+        session.MarkMessage(msg, "")
+    }
+    return nil
+}
+
+func StartConsumer(ctx context.Context) {
+    brokers := strings.Split(os.Getenv("KAFKA_BROKERS"), ",")
+    if len(brokers) == 0 || brokers[0] == "" {
+        brokers = []string{"localhost:9092"}
+    }
+
+    config := sarama.NewConfig()
+    config.Consumer.Group.Rebalance.Strategy = sarama.NewBalanceStrategyRoundRobin()
+    config.Consumer.Offsets.Initial = sarama.OffsetNewest
+    config.Version = sarama.V2_8_0_0
+
+    client, err := sarama.NewConsumerGroup(brokers, "analytics-service-group", config)
+    if err != nil {
+        log.Fatalf("Failed to create Kafka consumer group: %v", err)
+    }
+
+    topics := []string{"order.created", "inventory.reserved", "notification.sent", "order.updated"}
+    log.Printf("Analytics Kafka consumer started — topics: %v", topics)
+
+    go func() {
+        for {
+            if err := client.Consume(ctx, topics, consumerGroupHandler{}); err != nil {
+                log.Printf("Kafka consumer error: %v", err)
+            }
+            if ctx.Err() != nil {
+                return
+            }
+        }
+    }()
+}
+
+// extractTraceContext pulls W3C trace context from Kafka message headers
+func extractTraceContext(ctx context.Context, headers []*sarama.RecordHeader) context.Context {
+    carrier := make(map[string]string)
+    for _, h := range headers {
+        carrier[string(h.Key)] = string(h.Value)
+    }
+    // Use OTel propagator to extract
+    propagator := otel.GetTextMapPropagator()
+    return propagator.Extract(ctx, propagation.MapCarrier(carrier))
+}
+```
+
+## `analytics-service/internal/scheduler/cron.go`
+
+```go
+package scheduler
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "github.com/robfig/cron/v3"
+    "github.com/shopflow/analytics-service/internal/repository"
+    "github.com/shopflow/analytics-service/telemetry"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/codes"
+    "go.opentelemetry.io/otel/metric"
+)
+
+var (
+    reportsGenerated metric.Int64Counter
+    reportDuration   metric.Float64Histogram
+)
+
+func initMetrics() {
+    meter := telemetry.Meter("analytics-service/scheduler")
+    reportsGenerated, _ = meter.Int64Counter(
+        "analytics.reports.generated.total",
+        metric.WithDescription("Total sales reports generated by cron"),
+    )
+    reportDuration, _ = meter.Float64Histogram(
+        "analytics.report.generation.duration.seconds",
+        metric.WithDescription("Time taken to generate a sales report"),
+        metric.WithUnit("s"),
+    )
+}
+
+func StartScheduler(ctx context.Context, intervalSeconds int) *cron.Cron {
+    initMetrics()
+
+    c := cron.New(cron.WithSeconds())
+    schedule := formatSchedule(intervalSeconds)
+
+    c.AddFunc(schedule, func() {
+        generateReport(ctx)
+    })
+
+    c.Start()
+    log.Printf("Sales report scheduler started — running every %d seconds", intervalSeconds)
+    return c
+}
+
+func generateReport(ctx context.Context) {
+    tracer := telemetry.Tracer("analytics-service/scheduler")
+
+    // Each cron execution gets its own root span
+    ctx, span := tracer.Start(context.Background(), "scheduler.generate_sales_report")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.String("job.name", "sales_report"),
+        attribute.String("job.trigger", "cron"),
+    )
+
+    start := time.Now()
+    log.Println("Generating sales report...")
+
+    report, err := repository.GenerateSalesReport(ctx)
+    duration := time.Since(start).Seconds()
+
+    reportDuration.Record(ctx, duration)
+
+    if err != nil {
+        log.Printf("Failed to generate sales report: %v", err)
+        span.RecordError(err)
+        span.SetStatus(codes.Error, err.Error())
+        return
+    }
+
+    reportsGenerated.Add(ctx, 1)
+    span.SetAttributes(
+        attribute.Int("report.total_orders", report.TotalOrders),
+        attribute.Float64("report.total_revenue", report.TotalRevenue),
+        attribute.String("report.top_product", report.TopProduct),
+    )
+    span.SetStatus(codes.Ok, "report generated")
+
+    log.Printf("Sales report generated: orders=%d revenue=%.2f top_product=%s duration=%.3fs",
+        report.TotalOrders, report.TotalRevenue, report.TopProduct, duration)
+}
+
+func formatSchedule(seconds int) string {
+    // robfig/cron v3 with seconds: "*/N * * * * *"
+    return fmt.Sprintf("*/%d * * * * *", seconds)
+}
+```
+
+## `analytics-service/internal/api/handler.go`
+
+```go
+package api
+
+import (
+    "encoding/json"
+    "net/http"
+    "strconv"
+
+    "github.com/shopflow/analytics-service/internal/repository"
+    "github.com/shopflow/analytics-service/telemetry"
+    "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+)
+
+func NewRouter() http.Handler {
+    mux := http.NewServeMux()
+
+    mux.HandleFunc("/health", healthHandler)
+    mux.HandleFunc("/api/reports", reportsHandler)
+    mux.HandleFunc("/api/events/summary", eventsSummaryHandler)
+
+    // otelhttp wraps the entire mux — all HTTP calls are auto-traced
+    return otelhttp.NewHandler(mux, "analytics-service-http",
+        otelhttp.WithTracerProvider(telemetry.Tracer("").(*noop.Tracer).TracerProvider()),
+    )
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "analytics-service"})
+}
+
+func reportsHandler(w http.ResponseWriter, r *http.Request) {
+    limit := 10
+    if l := r.URL.Query().Get("limit"); l != "" {
+        if n, err := strconv.Atoi(l); err == nil {
+            limit = n
+        }
+    }
+
+    reports, err := repository.GetRecentReports(r.Context(), limit)
+    if err != nil {
+        http.Error(w, "Failed to fetch reports: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(reports)
+}
+
+func eventsSummaryHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Event summary endpoint — query order_events table for details",
+    })
+}
+```
+
+## `analytics-service/cmd/main.go`
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "strconv"
+    "syscall"
+    "time"
+
+    "github.com/shopflow/analytics-service/internal/api"
+    "github.com/shopflow/analytics-service/internal/db"
+    kafkaconsumer "github.com/shopflow/analytics-service/internal/kafka"
+    "github.com/shopflow/analytics-service/internal/scheduler"
+    "github.com/shopflow/analytics-service/telemetry"
+)
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // ── Telemetry ─────────────────────────────────────────────────────
+    otlpEndpoint := getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+    // Strip http:// prefix if present (grpc needs host:port)
+    otlpEndpoint = strings.TrimPrefix(otlpEndpoint, "http://")
+
+    shutdownTelemetry, err := telemetry.Init(ctx,
+        getEnv("OTEL_SERVICE_NAME", "analytics-service"),
+        getEnv("OTEL_SERVICE_VERSION", "1.0.0"),
+        otlpEndpoint,
+    )
+    if err != nil {
+        log.Fatalf("Failed to init telemetry: %v", err)
+    }
+    defer func() {
+        shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer shutdownCancel()
+        shutdownTelemetry(shutdownCtx)
+    }()
+
+    // ── Database ──────────────────────────────────────────────────────
+    if err := db.Connect(ctx); err != nil {
+        log.Fatalf("Failed to connect to database: %v", err)
+    }
+    defer db.Pool.Close()
+    log.Println("Connected to PostgreSQL")
+
+    // ── Kafka Consumer ────────────────────────────────────────────────
+    kafkaconsumer.StartConsumer(ctx)
+
+    // ── Cron Scheduler ────────────────────────────────────────────────
+    intervalSeconds := 60
+    if s := os.Getenv("CRON_INTERVAL_SECONDS"); s != "" {
+        if n, err := strconv.Atoi(s); err == nil {
+            intervalSeconds = n
+        }
+    }
+    cronJob := scheduler.StartScheduler(ctx, intervalSeconds)
+    defer cronJob.Stop()
+
+    // ── HTTP Server ───────────────────────────────────────────────────
+    port := getEnv("PORT", "8083")
+    server := &http.Server{
+        Addr:         fmt.Sprintf(":%s", port),
+        Handler:      api.NewRouter(),
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
+    }
+
+    go func() {
+        log.Printf("Analytics service listening on :%s", port)
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("HTTP server error: %v", err)
+        }
+    }()
+
+    // ── Graceful Shutdown ─────────────────────────────────────────────
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+    <-sigCh
+
+    log.Println("Shutting down analytics service...")
+    cancel()
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer shutdownCancel()
+    server.Shutdown(shutdownCtx)
+    log.Println("Analytics service stopped")
+}
+
+func getEnv(key, defaultVal string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return defaultVal
+}
+```
+
+---
+
+## 🚀 How to Run
+
+```bash
+# 1. Clone & build everything
+git clone https://github.com/yourname/shopflow-otel-demo
+cd shopflow-otel-demo
+
+# 2. Start all services
+docker compose up --build -d
+
+# 3. Wait ~30s for Kafka to stabilize, then create an order
+curl -X POST http://localhost:8080/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customerId": "CUST-001",
+    "productId":  "PROD-001",
+    "quantity":   2,
+    "unitPrice":  1299.99
+  }'
+
+# 4. Fire multiple orders to generate trace volume
+for i in {1..10}; do
+  curl -s -X POST http://localhost:8080/api/orders \
+    -H "Content-Type: application/json" \
+    -d "{\"customerId\":\"CUST-00$i\",\"productId\":\"PROD-00$((i % 5 + 1))\",\"quantity\":$i,\"unitPrice\":49.99}" &
+done
+
+# 5. Check order status
+curl http://localhost:8080/api/orders
+
+# 6. Check inventory
+curl http://localhost:8081/api/products
+
+# 7. Check analytics reports (generated every 60s by cron)
+curl http://localhost:8083/api/reports
+```
+
+---
+
+## 🔭 Observability Endpoints
+
+| Dashboard | URL | What you see |
+|---|---|---|
+| **Jaeger UI** | http://localhost:16686 | End-to-end distributed traces spanning all 4 services including Kafka hops |
+| **Prometheus** | http://localhost:9090 | Raw metrics — query `shopflow_*`, `http_*`, `kafka_*` |
+| **Grafana** | http://localhost:3001 (admin/admin) | Dashboards — add Prometheus + Jaeger datasources |
+| **Kafka UI** | http://localhost:8090 | Topic inspection, consumer lag per group |
+
+---
+
+## 🎯 What OTel Captures Automatically (Zero/Minimal Code)
+
+```
+Order Created (POST /api/orders)                           ← Spring HTTP auto-instrumentation
+  │
+  ├─ JDBC: INSERT INTO orders (10ms)                       ← Spring DB auto-instrumentation
+  │
+  ├─ Kafka PRODUCE → order.created (2ms)                   ← Kafka auto-instrumentation
+  │      │  [trace context in Kafka headers]
+  │      ▼
+  │  Kafka CONSUME → inventory-service (FastAPI)           ← aiokafka auto-instrumentation
+  │      │
+  │      ├─ Redis GET inventory:stock:PROD-001 (1ms)       ← Redis auto-instrumentation
+  │      ├─ PostgreSQL SELECT ... FOR UPDATE (5ms)         ← SQLAlchemy auto-instrumentation
+  │      ├─ PostgreSQL UPDATE products (3ms)               ← SQLAlchemy auto-instrumentation
+  │      └─ Kafka PRODUCE → inventory.reserved             ← aiokafka auto-instrumentation
+  │              │
+  │              ▼
+  │         Kafka CONSUME → notification-service (Express) ← kafkajs auto-instrumentation
+  │              │
+  │              ├─ HTTP PUT /api/orders/{id}/status       ← axios auto-instrumentation
+  │              │    → back to order-service Spring       ← Spring HTTP auto-instrumentation
+  │              │       └─ JDBC UPDATE orders.status      ← Spring DB auto-instrumentation
+  │              │
+  │              └─ Kafka PRODUCE → notification.sent      ← kafkajs auto-instrumentation
+  │                       │
+  │                       ▼
+  │                Kafka CONSUME → analytics-service (Go)  ← manual SDK (Go, no agent)
+  │                       └─ PostgreSQL INSERT event       ← pgx traced via SDK
+
+CRON (every 60s) → analytics-service                      ← manual SDK root span
+  └─ PostgreSQL aggregate query                            ← child span
+  └─ PostgreSQL INSERT sales_report                        ← child span
+```
+
+**Metrics auto-collected per service:**
+- HTTP request rate, latency P50/P95/P99, error rate (all 4 services)
+- Kafka consumer lag, produce/consume rate (all Kafka interactions)  
+- DB connection pool size, query duration (Spring HikariCP + SQLAlchemy)
+- Redis hit/miss ratio (inventory-service)
+- JVM heap, GC pause, threads (order-service Java agent)
+- Custom business: `shopflow_orders_created_total`, `inventory_reservations_total`, `analytics_reports_generated_total`

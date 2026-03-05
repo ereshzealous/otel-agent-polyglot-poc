@@ -1,0 +1,233 @@
+
+services:
+
+  # --- infra ---
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: shopflow-postgres
+    environment:
+      POSTGRES_USER: shopflow
+      POSTGRES_PASSWORD: shopflow123
+      POSTGRES_DB: postgres
+    volumes:
+      - ./infra/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh
+    ports:
+      - "5432:5432"
+    networks: [shopflow]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopflow"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: shopflow-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    networks: [shopflow]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: shopflow-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks: [shopflow]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: shopflow-kafka
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 1
+    ports:
+      - "29092:29092"
+    networks: [shopflow]
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: shopflow-kafka-ui
+    depends_on: [kafka]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: shopflow
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8090:8080"
+    networks: [shopflow]
+
+  # --- observability ---
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.96.0
+    container_name: shopflow-otel-collector
+    volumes:
+      - ./infra/otel/otel-collector.yaml:/etc/otel/config.yaml
+    command: ["--config=/etc/otel/config.yaml"]
+    ports:
+      - "4317:4317"   # gRPC
+      - "4318:4318"   # HTTP
+      - "8889:8889"   # prometheus scrape
+      - "13133:13133" # healthcheck
+    depends_on: [jaeger, prometheus]
+    networks: [shopflow]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: shopflow-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+    ports:
+      - "16686:16686" # UI
+      - "14317:4317"  # OTLP gRPC (avoid clash with collector's 4317)
+    networks: [shopflow]
+
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: shopflow-prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-remote-write-receiver'
+    ports:
+      - "9090:9090"
+    networks: [shopflow]
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: shopflow-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    depends_on: [prometheus, jaeger]
+    networks: [shopflow]
+
+  # --- services ---
+
+  order-service:     # Java / Spring Boot — zero-code instrumented via javaagent
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: shopflow-order
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ordersdb
+      SPRING_DATASOURCE_USERNAME: shopflow
+      SPRING_DATASOURCE_PASSWORD: shopflow123
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      JAVA_TOOL_OPTIONS: >-
+        -javaagent:/otel/opentelemetry-javaagent.jar
+        -Dotel.service.name=order-service
+        -Dotel.service.version=1.0.0
+        -Dotel.resource.attributes=team=platform,env=local
+        -Dotel.exporter.otlp.endpoint=http://otel-collector:4317
+        -Dotel.exporter.otlp.protocol=grpc
+        -Dotel.traces.exporter=otlp
+        -Dotel.metrics.exporter=otlp
+        -Dotel.logs.exporter=otlp
+        -Dotel.instrumentation.kafka.producer.propagation.enabled=true
+        -Dotel.instrumentation.kafka.consumer.propagation.enabled=true
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+  inventory-service:  # Python / FastAPI — uses opentelemetry-instrument CLI
+    build:
+      context: ./inventory-service
+      dockerfile: Dockerfile
+    container_name: shopflow-inventory
+    ports:
+      - "8081:8081"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://shopflow:shopflow123@postgres:5432/inventorydb
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PORT: 8081
+      OTEL_SERVICE_NAME: inventory-service
+      OTEL_SERVICE_VERSION: "1.0.0"
+      OTEL_RESOURCE_ATTRIBUTES: "team=platform,env=local"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+  notification-service: # Node.js / Express — tracing.js loaded via --require
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: shopflow-notification
+    ports:
+      - "8082:8082"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      ORDER_SERVICE_URL: http://order-service:8080
+      PORT: 8082
+      OTEL_SERVICE_NAME: notification-service
+      OTEL_SERVICE_VERSION: "1.0.0"
+      OTEL_RESOURCE_ATTRIBUTES: "team=platform,env=local"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+    depends_on:
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+  analytics-service:   # Go — SDK-level instrumentation in telemetry/setup.go
+    build:
+      context: ./analytics-service
+      dockerfile: Dockerfile
+    container_name: shopflow-analytics
+    ports:
+      - "8083:8083"
+    environment:
+      DATABASE_URL: postgres://shopflow:shopflow123@postgres:5432/analyticsdb?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      PORT: 8083
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: analytics-service
+      OTEL_SERVICE_VERSION: 1.0.0
+      CRON_INTERVAL_SECONDS: "60"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    networks: [shopflow]
+
+networks:
+  shopflow:
+    driver: bridge
