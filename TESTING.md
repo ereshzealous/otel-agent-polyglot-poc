@@ -3,6 +3,7 @@
 ## Quick Start
 
 ```bash
+chmod +x *.sh
 # One-click start: builds everything, starts infra + all 4 services
 ./start.sh
 
