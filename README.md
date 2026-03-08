@@ -499,45 +499,6 @@ docker compose down -v && docker compose up --build -d
 
 ---
 
-## Project Structure
-
-```
-.
-├── docker-compose.yml
-├── start.sh / stop.sh
-├── infra/
-│   ├── postgres/init.sh        # creates 3 databases + seed data
-│   ├── otel/otel-collector.yaml
-│   ├── prometheus/prometheus.yml
-│   └── grafana/provisioning/   # auto-provisions datasources
-│
-├── order-service/              # Java · Spring Boot · Gradle
-│   ├── Dockerfile              # downloads otel java agent at build time
-│   └── src/main/java/...      # zero otel code — agent does everything
-│
-├── inventory-service/          # Python · FastAPI · async SQLAlchemy
-│   ├── Dockerfile              # runs via opentelemetry-instrument CLI
-│   └── app/
-│       ├── kafka/              # manual trace propagation for aiokafka
-│       └── services/           # stock reservation with row locking
-│
-├── notification-service/       # Node.js · Express · kafkajs
-│   ├── Dockerfile              # loads tracing.js via --require
-│   ├── tracing.js              # OTel SDK setup + kafkajs instrumentation
-│   └── src/
-│       └── kafka/              # event routing and notifications
-│
-└── analytics-service/          # Go · sarama · pgx
-    ├── Dockerfile
-    ├── telemetry/setup.go      # manual OTel SDK wiring
-    └── internal/
-        ├── kafka/              # consumer with manual header extraction
-        ├── repository/         # event storage
-        └── api/                # reports endpoint
-```
-
----
-
 ## Key Takeaway
 
 OTel agents give you a strong baseline of observability with minimal code — **for the libraries
