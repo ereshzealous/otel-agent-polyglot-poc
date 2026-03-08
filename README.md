@@ -194,36 +194,6 @@ you need to add manual spans in your code. The agent can't read your mind.
 ShopFlow is a fake e-commerce backend with 4 services that communicate through Kafka events.
 The goal is to show a **single distributed trace flowing through all 4 services** when you create an order.
 
-### The Event Chain
-
-```
-Customer places order
-       │
-       ▼
-┌─────────────────┐     order.created      ┌────────────────────┐
-│  Order Service   │ ──────────────────────▶│ Inventory Service  │
-│  (Java/Spring)   │                        │   (Python/FastAPI)  │
-└─────────────────┘                        └────────────────────┘
-       │                                            │
-       │                                   inventory.reserved
-       │                                            │
-       │                                            ▼
-       │                                   ┌────────────────────┐
-       │                                   │Notification Service│
-       │            order.created          │  (Node.js/Express) │
-       │ ─────────────────────────────────▶│                    │
-       │                                   └────────────────────┘
-       │                                            │
-       │               all events                   │
-       │                   │         notification.sent
-       ▼                   ▼                        │
-┌─────────────────────────────────────┐             │
-│       Analytics Service (Go)        │◀────────────┘
-│   consumes everything, builds       │
-│   reports on a cron schedule        │
-└─────────────────────────────────────┘
-```
-
 ### Architecture Diagram
 
 ```mermaid
